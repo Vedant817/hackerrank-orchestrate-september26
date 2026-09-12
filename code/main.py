@@ -22,6 +22,7 @@ via images.csv mapping — no hardcoded amounts. Requires: rapidocr_onnxruntime,
 onnxruntime, pillow, numpy (see code/requirements.txt).
 """
 import csv
+import calendar
 import hashlib
 import json
 import os
@@ -203,23 +204,11 @@ def _order_lines(result):
     items.sort(key=lambda i: (round(i["y0"] / max(1, max_y) * 100), i["x0"]))
     return items
 
-def extract_image_amount(image_path, event_hint=""):
-    """Run RapidOCR at runtime and return the total amount. No hardcoded values.
-
-    Own approach over raw OCR: geometry-ordered lines, position-aware scoring
-    (totals live bottom-third + right column), and amount-in-words cross-check.
-    """
-    key_src = os.path.basename(image_path) + "|" + str(os.path.getsize(image_path)) if os.path.exists(image_path) else image_path
-    ckey = hashlib.md5(key_src.encode()).hexdigest()[:16]
-    if ckey in _OCR_CACHE:
-        return float(_OCR_CACHE[ckey])
-    engine = _ocr_engine()
-    result, _ = engine(image_path)
-    items = _order_lines(result)
+def _pick_candidates(items, hint):
+    """Score keyword-anchored amount candidates from ordered OCR lines."""
     full = "\n".join(i["t"] for i in items)
     low = full.lower()
-    h = (event_hint or "").lower()
-    # amount-in-words reference (e.g. 'In Words: Rupees Fifteen Thousand...')
+    h = (hint or "").lower()
     words_val = None
     for m in re.finditer(r"in words?\s*:?|terbilang\s*:?", low):
         seg = full[m.end():m.end() + 250]
@@ -229,7 +218,6 @@ def extract_image_amount(image_path, event_hint=""):
     cands = []
     for kw, base in _OCR_KEYWORDS:
         for m in re.finditer(re.escape(kw), low):
-            # locate source line for geometry
             pos = m.start()
             acc, line_idx = 0, 0
             for idx, it in enumerate(items):
@@ -245,10 +233,8 @@ def extract_image_amount(image_path, event_hint=""):
                 continue
             pick = vals[0]  # closest amount after keyword (totals follow their label)
             score = base + float(src.get("c", 0.8)) * 2.0
-            # tax/fee rows never hold the payable total (multilingual guard)
             if _TAX_LINE_RE.search(src.get("t", "")):
                 score -= 60
-            # geometry priors: totals sit bottom-third and right-column
             if kw in ("grand total", "total paid", "total amount received", "net amount",
                       "total bill amount", "balance due", "amount payable", "net pay", "total",
                       "total bayar", "jumlah bayar"):
@@ -263,10 +249,67 @@ def extract_image_amount(image_path, event_hint=""):
                     score -= 20
             if "salary" in h and kw == "net pay":
                 score += 25
-            # words cross-check: candidate matching the written amount wins ties
             if words_val and abs(pick - words_val) / max(1.0, words_val) < 0.02:
                 score += 30
             cands.append((score, pick))
+    cands.sort(key=lambda x: (x[0], x[1]))
+    mean_conf = sum(float(i.get("c", 0.8)) for i in items) / max(1, len(items))
+    return cands, full, mean_conf
+
+def _preprocess_variants(image_path):
+    """PIL-only enhancements for weak reads (upscale + contrast). No new deps."""
+    try:
+        from PIL import Image, ImageOps, ImageFilter
+    except Exception:
+        return []
+    out = []
+    try:
+        img = Image.open(image_path).convert("RGB")
+        w, hgt = img.size
+        big = img.resize((w * 2, hgt * 2))
+        p1 = os.path.join(CACHE_DIR, "_ocr_up.png")
+        big.save(p1)
+        out.append(p1)
+        gray = ImageOps.grayscale(big)
+        gray = ImageOps.autocontrast(gray, cutoff=1)
+        p2 = os.path.join(CACHE_DIR, "_ocr_gray.png")
+        gray.save(p2)
+        out.append(p2)
+    except Exception:
+        pass
+    return out
+
+def extract_image_amount(image_path, event_hint=""):
+    """Run RapidOCR at runtime and return the total amount. No hardcoded values.
+
+    Own approach over raw OCR: geometry-ordered lines, position-aware scoring
+    (totals live bottom-third + right column), amount-in-words cross-check, and
+    a PIL preprocessing retry when the first pass reads weakly.
+    """
+    key_src = os.path.basename(image_path) + "|" + str(os.path.getsize(image_path)) if os.path.exists(image_path) else image_path
+    ckey = hashlib.md5(key_src.encode()).hexdigest()[:16]
+    if ckey in _OCR_CACHE:
+        return float(_OCR_CACHE[ckey])
+    engine = _ocr_engine()
+    result, _ = engine(image_path)
+    items = _order_lines(result)
+    cands, full, mean_conf = _pick_candidates(items, event_hint)
+    # Retry weakly-read images (handwriting, phone photos) with enhancements,
+    # adopting the variant only if its top candidate scores strictly higher.
+    if (not cands or mean_conf < 0.78) and items:
+        base_top = cands[-1][0] if cands else -1
+        for vp in _preprocess_variants(image_path):
+            try:
+                r2, _ = engine(vp)
+                items2 = _order_lines(r2)
+                if not items2:
+                    continue
+                c2, _, _ = _pick_candidates(items2, event_hint)
+                if c2 and c2[-1][0] > base_top:
+                    cands = c2
+                    base_top = c2[-1][0]
+            except Exception:
+                continue
     if not cands:
         # fallback: largest decimal amount on page (safer direction resolved by caller)
         allv = _amounts_in_window(full)
@@ -276,7 +319,6 @@ def extract_image_amount(image_path, event_hint=""):
         best = max(dec)
         _OCR_CACHE[ckey] = best
     else:
-        cands.sort(key=lambda x: (x[0], x[1]))
         _OCR_CACHE[ckey] = float(cands[-1][1])
     try:
         with open(_OCR_CACHE_PATH, "w", encoding="utf-8") as f:
@@ -508,6 +550,39 @@ def resolve_events(user_events, fx, home):
         e2["_amt"] = float(amt)
         out.append(e2)
     return out
+
+def _add_months(d, n):
+    m = d.month - 1 + n
+    y = d.year + m // 12
+    m = m % 12 + 1
+    return date(y, m, min(d.day, calendar.monthrange(y, m)[1]))
+
+def _iter_cadence(last_date, iv, rdate, horizon_days, max_n=12):
+    """Yield future cadence dates >= rdate. Monthly cadences (27-33d) snap to
+    the same day-of-month so forecasts, overrides, and spending changes share
+    identical dates (no 30-day drift). General helper, no hardcoded dates."""
+    monthly = 27 <= iv <= 33
+    if monthly:
+        n = 1
+        d = _add_months(last_date, n)
+        while d < rdate:
+            n += 1
+            d = _add_months(last_date, n)
+        guard = 0
+        while (d - rdate).days < horizon_days and guard < max_n:
+            yield d
+            n += 1
+            d = _add_months(last_date, n)
+            guard += 1
+    else:
+        d = last_date + timedelta(days=iv)
+        while d < rdate:
+            d += timedelta(days=iv)
+        guard = 0
+        while (d - rdate).days < horizon_days and guard < max_n:
+            yield d
+            d += timedelta(days=iv)
+            guard += 1
 
 def detect_recurrence(history, request_date):
     """history: settled events with _ed < request_date. Return groups dict key->info.
@@ -766,29 +841,7 @@ def build_daily_flows(profile, events, request_date, home, fx, messages, rec_ove
                 continue
         # apply salary resets/increases: if message overrides salary, adjust forecasted income amounts/dates
         amt = g["cons_amount"]
-        monthly = 27 <= iv <= 33  # calendar-monthly cadence: snap to same day-of-month
-        def _add_months(d, n):
-            m = d.month - 1 + n
-            y = d.year + m // 12
-            m = m % 12 + 1
-            import calendar as _cal
-            return date(y, m, min(d.day, _cal.monthrange(y, m)[1]))
-        if monthly:
-            # step by calendar months from last_date to avoid 30-day drift (15th stays 15th)
-            n = 1
-            nxt = _add_months(g["last_date"], n)
-            while nxt < rdate:
-                n += 1
-                nxt = _add_months(g["last_date"], n)
-        else:
-            nxt = g["last_date"] + timedelta(days=iv)
-            # fast-forward to >= rdate
-            while nxt < rdate:
-                nxt = nxt + timedelta(days=iv)
-        d = nxt
-        guard = 0
-        step_n = n if monthly else 0
-        while (d - rdate).days < horizon and guard < 12:
+        for d in _iter_cadence(g["last_date"], iv, rdate, horizon):
             day = (d - rdate).days
             # avoid double count with scheduled same category within 4 days
             # (we already added scheduled; if recurrence lands within 4d of a scheduled income/expense of same category, skip recurrence)
@@ -817,12 +870,6 @@ def build_daily_flows(profile, events, request_date, home, fx, messages, rec_ove
                             bump = 1.12
                             break
                     exp[day] += amt * bump * (1.0 + expense_margin) * (1.0 + cat_margin.get(g["category"], 0.0))
-            if monthly:
-                step_n += 1
-                d = _add_months(g["last_date"], step_n)
-            else:
-                d = d + timedelta(days=iv)
-            guard += 1
     # Salary extension: ensure monthly salary continues beyond last scheduled (e.g., 1 settled + 1 scheduled -> forecast Apr/May)
     # Skip if a salary recurrence already forecasts (avoid double-count); also exclude bonus/commission one-offs from cadence.
     try:
@@ -840,29 +887,10 @@ def build_daily_flows(profile, events, request_date, home, fx, messages, rec_ove
                     ivm = int(round(sum(ivs) / len(ivs)))
                     last_sd = sal_all[-1]["_sd"]
                     last_amt = sal_all[-1]["_home_amt"]
-                    # calendar-monthly snap so payroll stays on its day-of-month
-                    import calendar as _cal2
-                    monthly2 = 27 <= ivm <= 33
-                    if monthly2:
-                        sn = 1
-                        def _am(d0, k):
-                            m = d0.month - 1 + k
-                            return date(d0.year + m // 12, m % 12 + 1,
-                                        min(d0.day, _cal2.monthrange(d0.year + m // 12, m % 12 + 1)[1]))
-                        d = _am(last_sd, sn)
-                    else:
-                        d = last_sd + timedelta(days=ivm)
-                    guard = 0
-                    while (d - rdate).days < horizon and guard < 6:
+                    for d in _iter_cadence(last_sd, ivm, rdate, horizon, max_n=6):
                         day = (d - rdate).days
                         if day >= 0 and inc[day] == 0:
                             inc[day] += last_amt
-                        if monthly2:
-                            sn += 1
-                            d = _am(last_sd, sn)
-                        else:
-                            d += timedelta(days=ivm)
-                        guard += 1
     except Exception:
         pass
     # message-confirmed one-off/updated incomes not already in events
@@ -967,19 +995,24 @@ def build_daily_flows(profile, events, request_date, home, fx, messages, rec_ove
             ongoing.sort()
             eff_dt, eff_amt = ongoing[-1]
             # remove previously added recurring salary income on/after eff_dt and replace with eff_amt on same cadence
-            # find salary rec groups
+            # find salary rec groups (base pay only: never touch commission/bonus
+            # cadences — those were excluded from the forecast, so touching them
+            # here would invent phantom income on dates nothing was counted)
+            _NO_FORECAST = ("commission", "bonus", "arrears", "prize", "lottery",
+                            "refund", "investment", "quarterly")
             for key, g in rec.items():
                 if g["direction"] != "credit":
                     continue
                 cat = (g["category"] or "").lower()
                 if "salary" not in cat and "payroll" not in (g["description"] or "").lower() and "income" not in cat:
                     continue
+                if any(k in (g["description"] or "").lower() for k in _NO_FORECAST):
+                    continue
                 iv = g["interval"]
                 # clear previously added inc for this cadence >= eff_dt (approx: subtract old cons amounts)
-                d = g["last_date"] + timedelta(days=iv)
-                while d < rdate:
-                    d += timedelta(days=iv)
-                while (d - rdate).days < horizon:
+                # NOTE: same shared cadence as the forecast loop (calendar snap for
+                # monthly), so subtraction lands exactly on the added dates.
+                for d in _iter_cadence(g["last_date"], iv, rdate, horizon):
                     if d >= eff_dt:
                         day = (d - rdate).days
                         inc[day] -= g["cons_amount"]
@@ -987,7 +1020,6 @@ def build_daily_flows(profile, events, request_date, home, fx, messages, rec_ove
                             # clamp? keep but will re-add
                             pass
                         inc[day] += eff_amt
-                    d += timedelta(days=iv)
             # clamp negatives from double subtract
             for i in range(horizon):
                 if inc[i] < 0 and inc[i] > -1e-6:
@@ -1193,14 +1225,10 @@ def adjust_flows_for_changes(inc, exp, rec, request_date, pool_by_eid, changes, 
             continue
         iv = g["interval"]
         if act == "stop":
-            # remove future occurrences
-            d = g["last_date"] + timedelta(days=iv)
-            while d < request_date:
-                d += timedelta(days=iv)
-            while (d - request_date).days < n:
+            # remove future occurrences (shared cadence: matches forecast dates)
+            for d in _iter_cadence(g["last_date"], iv, request_date, n):
                 day = (d - request_date).days
                 exp2[day] = max(0.0, exp2[day] - g["cons_amount"])
-                d += timedelta(days=iv)
         elif act == "reduce_to":
             # reduce each future occurrence from cons_amount to na (na in home)
             try:
@@ -1210,13 +1238,9 @@ def adjust_flows_for_changes(inc, exp, rec, request_date, pool_by_eid, changes, 
             diff = g["cons_amount"] - new_home
             if diff <= 0:
                 continue
-            d = g["last_date"] + timedelta(days=iv)
-            while d < request_date:
-                d += timedelta(days=iv)
-            while (d - request_date).days < n:
+            for d in _iter_cadence(g["last_date"], iv, request_date, n):
                 day = (d - request_date).days
                 exp2[day] = max(0.0, exp2[day] - diff)
-                d += timedelta(days=iv)
     return inc2, exp2
 
 # ---------------------------------------------------------------------------
