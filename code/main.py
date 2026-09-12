@@ -629,8 +629,15 @@ def detect_recurrence(history, request_date):
         if lst[0].get("direction") == "debit":
             cons = max(x["_home_amt"] for x in recent)
         else:
-            # income: use latest (scheduled/confirmed) amount, not min (prorated first salary is anomalously low)
-            cons = lst[-1]["_home_amt"]
+            # Primary pay uses the latest confirmed level; secondary/other
+            # household incomes are less certain, so the safer interpretation
+            # (spec: prefer it when unresolved) is the recent minimum.
+            _d = (desc or "").lower()
+            if any(k in _d for k in ["second", "secondary", "other", "additional", "extra"]):
+                cons = min(x["_home_amt"] for x in recent)
+            else:
+                # income: use latest (scheduled/confirmed) amount, not min (prorated first salary is anomalously low)
+                cons = lst[-1]["_home_amt"]
         # active check: last occurrence must be recent (within 1.5*interval + 7d) else stale, skip
         try:
             gap = 9999
@@ -975,21 +982,49 @@ def build_daily_flows(profile, events, request_date, home, fx, messages, rec_ove
                     # To avoid double count, we will treat override total = hv0+hv1
                     overrides.append((dt0, hv0 + hv1, "temp_total"))
                     continue
-            overrides.append((dt if dt else rdate, hv, "temp"))
+            overrides.append((dt, hv, "temp"))
         else:
             if kind in ("reset", "increase"):
-                overrides.append((dt if dt else rdate, hv, "ongoing"))
+                overrides.append((dt, hv, "ongoing"))
             elif kind == "temp":
-                overrides.append((dt if dt else rdate, hv, "temp"))
+                overrides.append((dt, hv, "temp"))
             else:  # confirm_once
                 # dated first-salary confirmation: amend that payroll date (replace if exists, else add)
-                overrides.append((dt if dt else rdate, hv, "once"))
+                overrides.append((dt, hv, "once"))
     # apply overrides: for once/temp on specific date, if no scheduled/recurrence covers it, add; for ongoing, reset future rec income
     # Implementation: zero out previously forecasted income from salary rec groups and re-add with new amounts
     if overrides:
+        # Dateless "next salary / next payroll / next payslip" messages target the
+        # next forecasted payday — never day 0 (day-0 credit would invent income
+        # the user does not have yet). General rule from message wording.
+        _paydays = []
+        for _g in rec.values():
+            if _g.get("direction") != "credit":
+                continue
+            _c = (_g.get("category") or "").lower()
+            _dd = (_g.get("description") or "").lower()
+            if "salary" not in _c and "payroll" not in _dd and "income" not in _c:
+                continue
+            for _d in _iter_cadence(_g["last_date"], _g["interval"], rdate, horizon, max_n=2):
+                _paydays.append(_d)
+        for _e in events:
+            if _e.get("status") != "scheduled" or _e.get("direction") != "credit":
+                continue
+            _c = (_e.get("category") or "").lower()
+            _dd = (_e.get("description") or "").lower()
+            if "salary" in _c or "payroll" in _dd or "salary" in _dd:
+                if _e["_sd"] >= rdate:
+                    _paydays.append(_e["_sd"])
+        _paydays = sorted(set(_paydays))
+        _next_pay = _paydays[0] if _paydays else rdate
+        # re-point dateless one-off overrides (dt is None = no date stated) at the
+        # next payday; ongoing dateless resets apply from the request date.
+        overrides = [(_next_pay if (dt is None and k in ("once", "temp")) else
+                      (rdate if dt is None else dt), hv, k)
+                     for dt, hv, k in overrides]
         # separate ongoing (effective from date onward) vs once
-        ongoing = [(dt, hv) for dt, hv, k in overrides if k in ("ongoing", "temp_total") and dt]
-        once = [(dt, hv) for dt, hv, k in overrides if k in ("once", "temp") and dt]
+        ongoing = [(dt, hv) for dt, hv, k in overrides if k in ("ongoing", "temp_total") and dt is not None]
+        once = [(dt, hv) for dt, hv, k in overrides if k in ("once", "temp") and dt is not None]
         if ongoing:
             # use latest effective date <= horizon? pick max dt (most recent instruction wins per conflict rules: newer same source)
             ongoing.sort()
