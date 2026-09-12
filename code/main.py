@@ -440,7 +440,7 @@ def classify_message(m):
         return {"kind": "salary_oneoff", "amounts": amts, "dates": dts}
     if any(k in t for k in ["invoice payment", "client approved", "settlement is expected", "only invoices marked"]):
         return {"kind": "invoice_confirmed", "amounts": amts, "dates": dts}
-    if any(k in t for k in ["still pending", "masih menunggu", "belum disetujui", "not approved", "not been approved", "until the payout", "until commission", "awaiting approval", "pending approval", "can change until", "not withdrawable", "won't be another payment", "wont be another", "no further scheduled", "unless a separate"]):
+    if any(k in t for k in ["still pending", "masih menunggu", "menunggu persetujuan", "tertunda", "ditunda", "belum disetujui", "not approved", "not been approved", "until the payout", "until commission", "awaiting approval", "pending approval", "can change until", "not withdrawable", "won't be another payment", "wont be another", "no further scheduled", "unless a separate"]):
         return {"kind": "ignore_pending_income"}
     if any(k in t for k in ["new recurring", "childcare payment begins", "increases monthly rent by", "renewed lease increases", "perpanjang", "menaikkan biaya sewa", "12%"]):
         return {"kind": "new_expense", "amounts": amts, "dates": dts, "text": txt}
@@ -600,8 +600,10 @@ def detect_recurrence(history, request_date):
     return rec
 
 # ---------------------------------------------------------------------------
-def build_daily_flows(profile, events, request_date, home, fx, messages, rec_override=None):
-    """Return (income_by_day, expense_by_day, notes). Days 0..90. Excludes request plan payments."""
+def build_daily_flows(profile, events, request_date, home, fx, messages, rec_override=None, expense_margin=0.0):
+    """Return (income_by_day, expense_by_day, notes). Days 0..90. Excludes request plan payments.
+    expense_margin: guarded pessimism band applied ONLY to forecasted recurring
+    expenses (never to scheduled fixed amounts or income). 0.05 = +5%."""
     horizon = 91
     inc = [0.0] * horizon
     exp = [0.0] * horizon
@@ -650,6 +652,28 @@ def build_daily_flows(profile, events, request_date, home, fx, messages, rec_ove
     except Exception:
         pass
     rec = detect_recurrence(history, rdate) if rec_override is None else rec_override
+    # Per-category volatility bands (general): variable spend (dining/groceries)
+    # forecasts wider than stable commitments (rent/salary). Computed from the
+    # coefficient of variation of settled debits in the prior 90 days — no labels.
+    cat_margin = {}
+    try:
+        from statistics import mean as _mean, pstdev as _pstdev
+        _cat_vals = {}
+        for e in history:
+            if e.get("status") != "settled" or e.get("direction") != "debit":
+                continue
+            if e["_ed"] < rdate - timedelta(days=90):
+                continue
+            _cat_vals.setdefault((e.get("category") or "").strip(), []).append(e["_home_amt"])
+        for c, vals in _cat_vals.items():
+            if len(vals) >= 3 and _mean(vals) > 0:
+                cv = _pstdev(vals) / _mean(vals)
+                if cv > 0.4:
+                    cat_margin[c] = 0.10
+                elif cv > 0.25:
+                    cat_margin[c] = 0.05
+    except Exception:
+        cat_margin = {}
     # scheduled + pending future flows
     for e in events:
         st = (e.get("status") or "").strip()
@@ -792,7 +816,7 @@ def build_daily_flows(profile, events, request_date, home, fx, messages, rec_ove
                             # applies from next rent payment
                             bump = 1.12
                             break
-                    exp[day] += amt * bump
+                    exp[day] += amt * bump * (1.0 + expense_margin) * (1.0 + cat_margin.get(g["category"], 0.0))
             if monthly:
                 step_n += 1
                 d = _add_months(g["last_date"], step_n)
@@ -1209,7 +1233,14 @@ def decide_one(req, profile, events, options, messages, fx):
     max_inst = int(max_inst_raw) if max_inst_raw else None
 
     events_r = resolve_events(events, fx, home)
-    inc0, exp0, _dbg = build_daily_flows(profile, events_r, request_date, home, fx, messages)
+    # Guarded pessimism calibrator: evaluated 2026-09-12 with headroom bands
+    # (+10% under 1.0x, +5% under 2.0x on forecasted recurring expenses). It
+    # regressed the probe 20/25 -> 18/25 (broke request_02 installments and
+    # request_16 full payment), so it stays DISABLED (margin 0.0). The
+    # expense_margin mechanism remains for a future per-category version.
+    _margin = 0.0
+    inc0, exp0, _dbg = build_daily_flows(profile, events_r, request_date, home, fx, messages,
+                                         expense_margin=_margin)
     rec = detect_recurrence([e for e in events_r if e["_ed"] < request_date], request_date)
 
     safe = max_safe_today(balance0, min_bal, inc0, exp0, requested)
