@@ -482,6 +482,13 @@ def classify_message(m):
         return {"kind": "salary_oneoff", "amounts": amts, "dates": dts}
     if any(k in t for k in ["invoice payment", "client approved", "settlement is expected", "only invoices marked"]):
         return {"kind": "invoice_confirmed", "amounts": amts, "dates": dts}
+    # Gig-platform payout warning (QuickCrew/TaskLoop/ShiftPay template): the next
+    # payout is pending, app earnings can change until close, balance not
+    # withdrawable. Per conflict rules this explicit amendment suppresses
+    # forecasting of payout/earnings streams for the user (see build_daily_flows).
+    if (("payout" in t or "earnings" in t) and
+            ("still pending" in t or "can change until" in t or "withdrawable" in t)):
+        return {"kind": "gig_pending"}
     if any(k in t for k in ["still pending", "masih menunggu", "menunggu persetujuan", "tertunda", "ditunda", "belum disetujui", "not approved", "not been approved", "until the payout", "until commission", "awaiting approval", "pending approval", "can change until", "not withdrawable", "won't be another payment", "wont be another", "no further scheduled", "unless a separate"]):
         return {"kind": "ignore_pending_income"}
     if any(k in t for k in ["new recurring", "childcare payment begins", "increases monthly rent by", "renewed lease increases", "perpanjang", "menaikkan biaya sewa", "12%"]):
@@ -698,10 +705,14 @@ def build_daily_flows(profile, events, request_date, home, fx, messages, rec_ove
     salary_confirms = []
     invoice_confirms = []
     income_ended = False
+    gig_pending = False  # gig-platform payout warning: do not forecast payout/earnings streams
     new_expenses = []  # (amount_home_daily? monthly amount, start_date, category)
     for m in messages:
         c = classify_message(m)
         k = c.get("kind")
+        if k == "gig_pending":
+            gig_pending = True
+            continue
         if k == "confirm_settlement" and c.get("event_id"):
             confirmed_settle.add(c["event_id"])
         elif k in ("salary_temp", "salary_increase", "salary_confirm", "salary_reset", "salary_oneoff", "invoice_confirmed"):
@@ -842,6 +853,11 @@ def build_daily_flows(profile, events, request_date, home, fx, messages, rec_ove
             # never forecast commission/bonus/arreas/prize/lottery as recurring income (until settled)
             if any(k in desc for k in ["commission", "bonus", "arrears", "prize", "lottery", "refund", "investment", "quarterly"]):
                 continue
+            # gig-platform warning: payout/earnings streams are explicitly pending
+            # and changeable per the provider message — forecasting them would
+            # count non-withdrawable money (the QuickCrew/TaskLoop trap)
+            if gig_pending and any(k in desc for k in ["payout", "earnings"]):
+                continue
             if income_ended and not salary_confirms and not salary_resets:
                 # employment ended with no new confirm -> do not forecast further salary
                 # but still allow already-scheduled (handled above)
@@ -885,6 +901,9 @@ def build_daily_flows(profile, events, request_date, home, fx, messages, rec_ove
             sal_all = [e for e in events if e.get("direction") == "credit" and (("salary" in (e.get("category") or "").lower()) or ("salary" in (e.get("description") or "").lower()) or ("payroll" in (e.get("description") or "").lower())) and e.get("status") in ("settled", "scheduled")]
             # exclude one-off bonus/commission/arreas descriptions from cadence
             sal_all = [e for e in sal_all if not any(k in (e.get("description") or "").lower() for k in ["bonus", "commission", "arrears", "one-time", "one time", "quarterly"])]
+            # gig-platform warning: never extend payout/earnings cadences either
+            if gig_pending:
+                sal_all = [e for e in sal_all if not any(k in (e.get("description") or "").lower() for k in ["payout", "earnings"])]
             sal_all = sorted(sal_all, key=lambda x: x["_sd"])
             # use those with sd <= rdate+90 for cadence; need at least 2 with monthly cadence
             if len(sal_all) >= 2 and not (income_ended and not salary_confirms and not salary_resets):
@@ -900,6 +919,11 @@ def build_daily_flows(profile, events, request_date, home, fx, messages, rec_ove
                             inc[day] += last_amt
     except Exception:
         pass
+    # NOTE (2026-09-12): a run-rate conservation top-up (prior-90d settled total
+    # spread evenly when the forecast fell short) was evaluated here and
+    # REJECTED: probe fell 20/25 -> 18/25 (broke request_02 installments and
+    # request_09 full payment). Past run-rate overstates future need for users
+    # whose request is small relative to buffer. Left out deliberately.
     # message-confirmed one-off/updated incomes not already in events
     # salary_temp: use amount for next payroll only (one occurrence)
     # salary_increase/reset/confirm: adjust future recurring income to new amount from effective date
@@ -1042,6 +1066,9 @@ def build_daily_flows(profile, events, request_date, home, fx, messages, rec_ove
                 if "salary" not in cat and "payroll" not in (g["description"] or "").lower() and "income" not in cat:
                     continue
                 if any(k in (g["description"] or "").lower() for k in _NO_FORECAST):
+                    continue
+                if gig_pending and any(k in (g["description"] or "").lower()
+                                       for k in ["payout", "earnings"]):
                     continue
                 iv = g["interval"]
                 # clear previously added inc for this cadence >= eff_dt (approx: subtract old cons amounts)
