@@ -1,0 +1,6 @@
+log.txt
+code/cache/
+code/__pycache__/
+**/__pycache__/
+output_samples.csv
+.env
