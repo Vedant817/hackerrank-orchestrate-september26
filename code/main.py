@@ -1106,6 +1106,11 @@ def build_daily_flows(profile, events, request_date, home, fx, messages, rec_ove
     for i in range(horizon):
         if inc[i] < 0:
             inc[i] = 0.0
+    # NOTE (2026-09-12): a +1-day bank-posting delay on forecasted income was
+    # evaluated here and REJECTED: probe fell 20/25 -> 19/25 and earliest exact
+    # 15/25 -> 11/25 (broke request_02 installments and request_23 wait).
+    # Same-day crediting matches truth more often; the -31-day misses come from
+    # elsewhere. Left out deliberately.
     return inc, exp, {"confirmed": list(confirmed_settle)}
 
 # ---------------------------------------------------------------------------
